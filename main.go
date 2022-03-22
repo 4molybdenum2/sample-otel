@@ -87,7 +87,7 @@ func main() {
 	// work begins
 	ctx, span := tracer.Start(
 		context.Background(),
-		"CollectorExporter-Example",
+		"Test-Example",
 		trace.WithAttributes(commonLabels...))
 	defer span.End()
 	for i := 0; i < 10; i++ {
