@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -22,7 +24,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/selector/simple"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 )
@@ -34,16 +36,17 @@ var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 func initProvider() func() {
 	ctx := context.Background()
 
-	// Create a otlpgrpc metric client
+	otelAgentAddr, ok := os.LookupEnv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if !ok {
+		otelAgentAddr = ":30080"
+	}
+
 	metricClient := otlpmetricgrpc.NewClient(
 		otlpmetricgrpc.WithInsecure(),
-		otlpmetricgrpc.WithEndpoint(":8889"))
-
-	// create an exporter for metric
+		otlpmetricgrpc.WithEndpoint(otelAgentAddr))
 	metricExp, err := otlpmetric.New(ctx, metricClient)
 	handleErr(err, "Failed to create the collector metric exporter")
 
-	// pusher pushes the metrics periodically to collector
 	pusher := controller.New(
 		processor.NewFactory(
 			simple.NewWithHistogramDistribution(),
@@ -52,26 +55,17 @@ func initProvider() func() {
 		controller.WithExporter(metricExp),
 		controller.WithCollectPeriod(2*time.Second),
 	)
-
-	// set meter provider - all meters can be made using this
 	global.SetMeterProvider(pusher)
 
-	// If the OpenTelemetry Collector is running on a local cluster (minikube or
-	// microk8s), it should be accessible through the NodePort service at the
-	// `localhost:30080` endpoint. Otherwise, replace `localhost` with the
-	// endpoint of your cluster. If you run the app inside k8s, then you can
-	// probably connect directly to the service through dns
-	// conn, err := grpc.DialContext(ctx, "localhost:30080", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	// handleErr(err, "failed to create gRPC connection to collector")
+	err = pusher.Start(ctx)
+	handleErr(err, "Failed to start metric pusher")
 
-	// Set up trace Client
 	traceClient := otlptracegrpc.NewClient(
 		otlptracegrpc.WithInsecure(),
-		otlptracegrpc.WithEndpoint(":30080"),
+		otlptracegrpc.WithEndpoint(otelAgentAddr),
 		otlptracegrpc.WithDialOption(grpc.WithBlock()))
-	// Set up a trace exporter
-	traceExporter, err := otlptrace.New(ctx, traceClient)
-	handleErr(err, "failed to create trace exporter")
+	traceExp, err := otlptrace.New(ctx, traceClient)
+	handleErr(err, "Failed to create the collector trace exporter")
 
 	res, err := resource.New(ctx,
 		resource.WithFromEnv(),
@@ -85,25 +79,27 @@ func initProvider() func() {
 	)
 	handleErr(err, "failed to create resource")
 
-	// Register the trace exporter with a TracerProvider, using a batch
-	// span processor to aggregate spans before export.
-	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+	bsp := sdktrace.NewBatchSpanProcessor(traceExp)
 	tracerProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 		sdktrace.WithResource(res),
 		sdktrace.WithSpanProcessor(bsp),
 	)
 
-	otel.SetTracerProvider(tracerProvider)
 	// set global propagator to tracecontext (the default is no-op).
 	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetTracerProvider(tracerProvider)
 
 	return func() {
-		// Shutdown will flush any remaining spans and shut down the exporter.
-		handleErr(tracerProvider.Shutdown(ctx), "failed to shutdown TracerProvider")
-
+		cxt, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := traceExp.Shutdown(cxt); err != nil {
+			otel.Handle(err)
+		}
 		// pushes any last exports to the receiver
-		handleErr(pusher.Stop(ctx), "failed to shutdown MeterProvider")
+		if err := pusher.Stop(cxt); err != nil {
+			otel.Handle(err)
+		}
 	}
 }
 
@@ -114,17 +110,17 @@ func handleErr(err error, message string) {
 }
 
 func main() {
-	// initialize Tracer
 	shutdown := initProvider()
 	defer shutdown()
 
-	meter := global.Meter("demo-server-meter")
-	serverAttribute := attribute.String("server-attribute", "foo")
+	meter := global.Meter("demo_server_meter")
+	serverAttribute := attribute.String("server_attribute", "foo")
 	commonLabels := []attribute.KeyValue{serverAttribute}
 	requestCount := metric.Must(meter).NewInt64Counter(
-		"demo_server/request_counts",
+		"demo_request_counts",
 		metric.WithDescription("The number of requests received"),
 	)
+
 	// create a handler wrapped in OpenTelemetry instrumentation
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		//  random sleep to simulate latency
@@ -143,17 +139,32 @@ func main() {
 		}
 		time.Sleep(time.Duration(sleep) * time.Millisecond)
 		ctx := req.Context()
+		span := trace.SpanFromContext(ctx)
+		span.SetAttributes(serverAttribute)
+
+		nr := int(rng.Int31n(7))
+		for i := 0; i < nr; i++ {
+			randLineLength := rng.Int63n(999)
+			meter.RecordBatch(
+				ctx,
+				commonLabels,
+				requestCount.Measurement(1),
+			)
+			fmt.Printf("#%d: LineLength: %dBy\n", i, randLineLength)
+		}
+
 		meter.RecordBatch(
 			ctx,
 			commonLabels,
 			requestCount.Measurement(1),
 		)
-		span := trace.SpanFromContext(ctx)
-		span.SetAttributes(serverAttribute)
 		w.Write([]byte("Hello World"))
 	})
 	wrappedHandler := otelhttp.NewHandler(handler, "/hello")
 
+	log.Printf("Running on port: %s", "7080")
+	// serve up the wrapped handler
 	http.Handle("/hello", wrappedHandler)
 	http.ListenAndServe(":7080", nil)
+
 }
